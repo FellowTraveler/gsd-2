@@ -55,7 +55,7 @@ Then:
 13. Read the template at `~/.gsd/agent/extensions/gsd/templates/task-summary.md`
 14. Write `{{taskSummaryAbsPath}}`
 15. Mark {{taskId}} done in `{{planPath}}` (change `[ ]` to `[x]`)
-16. Commit your work: `git add -A && git commit -m 'feat({{sliceId}}/{{taskId}}): <what was built>'`. If `git add` silently fails to stage files (a known git worktree stat-cache bug), use this workaround per file: `git update-index --cacheinfo 100644,$(git hash-object -w <file>),<file>` then commit. If that also fails, move on — the system will auto-commit remaining changes after your session ends.
+16. Do not commit manually — the system auto-commits your changes after this unit completes.
 17. Update `.gsd/STATE.md`
 
 You are on the slice branch. All work stays here.

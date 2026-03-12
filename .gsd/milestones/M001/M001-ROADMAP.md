@@ -61,7 +61,7 @@ This milestone is complete only when all are true:
 - [x] **S03: Bug fixes and doc corrections** `risk:medium` `depends:[S02]`
   > After this: Worktree create commits before fork. Worktree merge uses deterministic helper by default. README and GSD-WORKFLOW match actual branch deletion and snapshot behavior. Build passes.
 
-- [ ] **S04: Remove git commands from prompts** `risk:low` `depends:[S02]`
+- [x] **S04: Remove git commands from prompts** `risk:low` `depends:[S02]`
   > After this: execute-task.md, complete-slice.md, replan-slice.md, complete-milestone.md contain no raw git commands. worktree-merge.md unchanged. Verified by grep.
 
 - [ ] **S05: Enhanced features — merge guards, snapshots, auto-push, rich commits** `risk:medium` `depends:[S02]`
