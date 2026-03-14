@@ -101,24 +101,25 @@ export function readIntegrationBranch(basePath: string, milestoneId: string): st
 /**
  * Persist the integration branch for a milestone.
  *
- * Called once when auto-mode starts on a milestone. Records the branch
- * the user was on at that point, so that slice branches merge back to it
- * instead of the repo's default branch.
+ * Called when auto-mode starts on a milestone. Records the branch the user
+ * was on at that point, so that slice branches merge back to it instead of
+ * the repo's default branch. Idempotent when the branch matches; updates
+ * the record when the user starts from a different branch.
  *
  * The file is committed immediately so it survives branch switches — the
  * pre-switch auto-commit excludes `.gsd/` to avoid merge conflicts, and
  * uncommitted `.gsd/` files are discarded during checkout.
- *
- * Skips writing if an integration branch is already recorded (idempotent
- * across restarts) or if the current branch is already a GSD slice branch.
  */
 export function writeIntegrationBranch(basePath: string, milestoneId: string, branch: string): void {
   // Don't record slice branches as the integration target
   if (SLICE_BRANCH_RE.test(branch)) return;
-  // Don't overwrite an existing integration branch
-  if (readIntegrationBranch(basePath, milestoneId) !== null) return;
   // Validate
   if (!VALID_BRANCH_NAME.test(branch)) return;
+  // Skip if already recorded with the same branch (idempotent across restarts).
+  // If recorded with a different branch, update it — the user started auto-mode
+  // from a new branch and expects slices to merge back there (#300).
+  const existing_branch = readIntegrationBranch(basePath, milestoneId);
+  if (existing_branch === branch) return;
 
   const metaFile = milestoneMetaPath(basePath, milestoneId);
   mkdirSync(join(basePath, ".gsd", "milestones", milestoneId), { recursive: true });
