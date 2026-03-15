@@ -86,6 +86,14 @@ import {
 import { GitServiceImpl, runGit } from "./git-service.js";
 import { nativeCommitCountBetween } from "./native-git-bridge.js";
 import { getPriorSliceCompletionBlocker } from "./dispatch-guard.js";
+import {
+  createAutoWorktree,
+  enterAutoWorktree,
+  teardownAutoWorktree,
+  isInAutoWorktree,
+  getAutoWorktreePath,
+  getAutoWorktreeOriginalBase,
+} from "./auto-worktree.js";
 import type { GitPreferences } from "./git-service.js";
 import { truncateToWidth, visibleWidth } from "@gsd/pi-tui";
 import { makeUI, GLYPH, INDENT } from "../shared/ui.js";
@@ -144,6 +152,7 @@ let stepMode = false;
 let verbose = false;
 let cmdCtx: ExtensionCommandContext | null = null;
 let basePath = "";
+let originalBasePath = "";
 let gitService: GitServiceImpl | null = null;
 
 /** Track total dispatches per unit to detect stuck loops (catches A→B→A→B patterns) */
@@ -349,6 +358,27 @@ export async function stopAuto(ctx?: ExtensionContext, pi?: ExtensionAPI): Promi
 
   // Remove SIGTERM handler registered at auto-mode start
   deregisterSigtermHandler();
+
+  // ── Auto-worktree: exit worktree and reset basePath on stop ──
+  if (currentMilestoneId && isInAutoWorktree(basePath)) {
+    try {
+      teardownAutoWorktree(originalBasePath, currentMilestoneId);
+      basePath = originalBasePath;
+      gitService = new GitServiceImpl(basePath, loadEffectiveGSDPreferences()?.preferences?.git ?? {});
+      ctx?.ui.notify("Exited auto-worktree.", "info");
+    } catch (err) {
+      ctx?.ui.notify(
+        `Auto-worktree teardown failed: ${err instanceof Error ? err.message : String(err)}`,
+        "warning",
+      );
+      // Force basePath back to original even if teardown failed
+      if (originalBasePath) {
+        basePath = originalBasePath;
+        try { process.chdir(basePath); } catch { /* best-effort */ }
+      }
+    }
+  }
+
   const ledger = getLedger();
   if (ledger && ledger.units.length > 0) {
     const totals = getProjectTotals(ledger.units);
@@ -376,6 +406,7 @@ export async function stopAuto(ctx?: ExtensionContext, pi?: ExtensionAPI): Promi
   unitLifetimeDispatches.clear();
   currentUnit = null;
   currentMilestoneId = null;
+  originalBasePath = "";
   cachedSliceProgress = null;
   pendingCrashRecovery = null;
   _handlingAgentEnd = false;
@@ -581,8 +612,32 @@ export async function startAuto(
     // Ensure milestone ID is set on git service for integration branch resolution
     if (currentMilestoneId) setActiveMilestoneId(base, currentMilestoneId);
 
+    // ── Auto-worktree: re-enter worktree on resume if not already inside ──
+    if (currentMilestoneId && originalBasePath && !isInAutoWorktree(basePath)) {
+      try {
+        const existingWtPath = getAutoWorktreePath(originalBasePath, currentMilestoneId);
+        if (existingWtPath) {
+          const wtPath = enterAutoWorktree(originalBasePath, currentMilestoneId);
+          basePath = wtPath;
+          gitService = new GitServiceImpl(basePath, loadEffectiveGSDPreferences()?.preferences?.git ?? {});
+          ctx.ui.notify(`Re-entered auto-worktree at ${wtPath}`, "info");
+        } else {
+          // Worktree was deleted while paused — recreate it.
+          const wtPath = createAutoWorktree(originalBasePath, currentMilestoneId);
+          basePath = wtPath;
+          gitService = new GitServiceImpl(basePath, loadEffectiveGSDPreferences()?.preferences?.git ?? {});
+          ctx.ui.notify(`Recreated auto-worktree at ${wtPath}`, "info");
+        }
+      } catch (err) {
+        ctx.ui.notify(
+          `Auto-worktree re-entry failed: ${err instanceof Error ? err.message : String(err)}. Continuing at current path.`,
+          "warning",
+        );
+      }
+    }
+
     // Re-register SIGTERM handler for the resumed session
-    registerSigtermHandler(base);
+    registerSigtermHandler(basePath);
 
     ctx.ui.setStatus("gsd-auto", stepMode ? "next" : "auto");
     ctx.ui.setFooter(hideFooter);
@@ -717,6 +772,36 @@ export async function startAuto(
   if (currentMilestoneId) {
     captureIntegrationBranch(base, currentMilestoneId);
     setActiveMilestoneId(base, currentMilestoneId);
+  }
+
+  // ── Auto-worktree: create or enter worktree for the active milestone ──
+  // Store the original project root before any chdir so we can restore on stop.
+  originalBasePath = base;
+  if (currentMilestoneId) {
+    try {
+      const existingWtPath = getAutoWorktreePath(base, currentMilestoneId);
+      if (existingWtPath) {
+        // Worktree already exists (e.g., previous session created it) — enter it.
+        const wtPath = enterAutoWorktree(base, currentMilestoneId);
+        basePath = wtPath;
+        gitService = new GitServiceImpl(basePath, loadEffectiveGSDPreferences()?.preferences?.git ?? {});
+        ctx.ui.notify(`Entered auto-worktree at ${wtPath}`, "info");
+      } else {
+        // Fresh start — create worktree and enter it.
+        const wtPath = createAutoWorktree(base, currentMilestoneId);
+        basePath = wtPath;
+        gitService = new GitServiceImpl(basePath, loadEffectiveGSDPreferences()?.preferences?.git ?? {});
+        ctx.ui.notify(`Created auto-worktree at ${wtPath}`, "info");
+      }
+      // Re-register SIGTERM handler with the new basePath
+      registerSigtermHandler(basePath);
+    } catch (err) {
+      // Worktree creation is non-fatal — continue in the project root.
+      ctx.ui.notify(
+        `Auto-worktree setup failed: ${err instanceof Error ? err.message : String(err)}. Continuing in project root.`,
+        "warning",
+      );
+    }
   }
 
   // Initialize metrics — loads existing ledger from disk
@@ -1428,7 +1513,7 @@ async function dispatchNextUnit(
     unitRecoveryCount.clear();
     unitLifetimeDispatches.clear();
     // Capture integration branch for the new milestone and update git service
-    captureIntegrationBranch(basePath, mid);
+    captureIntegrationBranch(originalBasePath || basePath, mid);
   }
   if (mid) {
     currentMilestoneId = mid;

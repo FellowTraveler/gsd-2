@@ -53,7 +53,7 @@ This milestone is complete only when all are true:
 
 ## Slices
 
-- [ ] **S01: Auto-worktree lifecycle in auto-mode** `risk:high` `depends:[]`
+- [x] **S01: Auto-worktree lifecycle in auto-mode** `risk:high` `depends:[]`
   > After this: `startAuto()` on a new milestone creates a worktree under `.gsd/worktrees/M003/`, `chdir`s into it, and dispatches units inside the worktree. Pause/resume re-enters the worktree. Progress widget shows the worktree branch. Verified via running auto-mode unit dispatch in a temp repo worktree.
 
 - [ ] **S02: --no-ff slice merges + conflict elimination** `risk:high` `depends:[S01]`
