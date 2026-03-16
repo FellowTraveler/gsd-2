@@ -37,12 +37,13 @@ import {
 import { loadPrompt } from "./prompt-loader.js";
 
 import { handleRemote } from "../remote-questions/remote-command.js";
+import { handleQuick } from "./quick.js";
 import { handleHistory } from "./history.js";
 import { handleUndo } from "./undo.js";
 import { handleExport } from "./export.js";
 import { nativeBranchList, nativeDetectMainBranch, nativeBranchListMerged, nativeBranchDelete, nativeForEachRef, nativeUpdateRef } from "./native-git-bridge.js";
 
-function dispatchDoctorHeal(pi: ExtensionAPI, scope: string | undefined, reportText: string, structuredIssues: string): void {
+export function dispatchDoctorHeal(pi: ExtensionAPI, scope: string | undefined, reportText: string, structuredIssues: string): void {
   const workflowPath = process.env.GSD_WORKFLOW_PATH ?? join(process.env.HOME ?? "~", ".pi", "GSD-WORKFLOW.md");
   const workflow = readFileSync(workflowPath, "utf-8");
   const prompt = loadPrompt("doctor-heal", {
@@ -67,13 +68,13 @@ function projectRoot(): string {
 
 export function registerGSDCommand(pi: ExtensionAPI): void {
   pi.registerCommand("gsd", {
-    description: "GSD — Get Shit Done: /gsd help|next|auto|stop|pause|status|visualize|queue|capture|triage|history|undo|skip|export|cleanup|prefs|config|hooks|run-hook|doctor|migrate|remote|steer|knowledge",
+    description: "GSD — Get Shit Done: /gsd help|next|auto|stop|pause|status|visualize|queue|quick|capture|triage|history|undo|skip|export|cleanup|mode|prefs|config|hooks|run-hook|skill-health|doctor|migrate|remote|steer|knowledge",
     getArgumentCompletions: (prefix: string) => {
       const subcommands = [
-        "help", "next", "auto", "stop", "pause", "status", "visualize", "queue", "discuss",
+        "help", "next", "auto", "stop", "pause", "status", "visualize", "queue", "quick", "discuss",
         "capture", "triage",
-        "history", "undo", "skip", "export", "cleanup", "prefs",
-        "config", "hooks", "run-hook", "doctor", "migrate", "remote", "steer", "inspect", "knowledge",
+        "history", "undo", "skip", "export", "cleanup", "mode", "prefs",
+        "config", "hooks", "run-hook", "skill-health", "doctor", "migrate", "remote", "steer", "inspect", "knowledge",
       ];
       const parts = prefix.trim().split(/\s+/);
 
@@ -88,6 +89,13 @@ export function registerGSDCommand(pi: ExtensionAPI): void {
         return ["--verbose", "--debug"]
           .filter((f) => f.startsWith(flagPrefix))
           .map((f) => ({ value: `auto ${f}`, label: f }));
+      }
+
+      if (parts[0] === "mode" && parts.length <= 2) {
+        const subPrefix = parts[1] ?? "";
+        return ["global", "project"]
+          .filter((cmd) => cmd.startsWith(subPrefix))
+          .map((cmd) => ({ value: `mode ${cmd}`, label: cmd }));
       }
 
       if (parts[0] === "prefs" && parts.length <= 2) {
@@ -174,6 +182,15 @@ export function registerGSDCommand(pi: ExtensionAPI): void {
 
       if (trimmed === "visualize") {
         await handleVisualize(ctx);
+        return;
+      }
+
+      if (trimmed === "mode" || trimmed.startsWith("mode ")) {
+        const modeArgs = trimmed.replace(/^mode\s*/, "").trim();
+        const scope = modeArgs === "project" ? "project" : "global";
+        const path = scope === "project" ? getProjectGSDPreferencesPath() : getGlobalGSDPreferencesPath();
+        await ensurePreferencesFile(path, ctx, scope);
+        await handlePrefsMode(ctx, scope);
         return;
       }
 
@@ -287,6 +304,11 @@ export function registerGSDCommand(pi: ExtensionAPI): void {
         return;
       }
 
+      if (trimmed === "quick" || trimmed.startsWith("quick ")) {
+        await handleQuick(trimmed.replace(/^quick\s*/, "").trim(), ctx, pi);
+        return;
+      }
+
       if (trimmed === "config") {
         await handleConfig(ctx);
         return;
@@ -295,6 +317,12 @@ export function registerGSDCommand(pi: ExtensionAPI): void {
       if (trimmed === "hooks") {
         const { formatHookStatus } = await import("./post-unit-hooks.js");
         ctx.ui.notify(formatHookStatus(), "info");
+        return;
+      }
+
+      // ─── Skill Health ────────────────────────────────────────────
+      if (trimmed === "skill-health" || trimmed.startsWith("skill-health ")) {
+        await handleSkillHealth(trimmed.replace(/^skill-health\s*/, "").trim(), ctx);
         return;
       }
 
@@ -394,6 +422,7 @@ function showHelp(ctx: ExtensionCommandContext): void {
     "  /gsd knowledge <type> <text>   Add rule, pattern, or lesson to KNOWLEDGE.md",
     "",
     "CONFIGURATION",
+    "  /gsd mode           Set workflow mode (solo/team)  [global|project]",
     "  /gsd prefs          Manage preferences  [global|project|status|wizard|setup]",
     "  /gsd config         Set API keys for external tools",
     "  /gsd hooks          Show post-unit hook configuration",
@@ -509,6 +538,36 @@ async function handlePrefs(args: string, ctx: ExtensionCommandContext): Promise<
   }
 
   ctx.ui.notify("Usage: /gsd prefs [global|project|status|wizard|setup]", "info");
+}
+
+async function handlePrefsMode(ctx: ExtensionCommandContext, scope: "global" | "project"): Promise<void> {
+  const path = scope === "project" ? getProjectGSDPreferencesPath() : getGlobalGSDPreferencesPath();
+  const existing = scope === "project" ? loadProjectGSDPreferences() : loadGlobalGSDPreferences();
+  const prefs: Record<string, unknown> = existing?.preferences ? { ...existing.preferences } : {};
+
+  await configureMode(ctx, prefs);
+
+  // Serialize and save
+  prefs.version = prefs.version || 1;
+  const frontmatter = serializePreferencesToFrontmatter(prefs);
+
+  let body = "\n# GSD Skill Preferences\n\nSee `~/.gsd/agent/extensions/gsd/docs/preferences-reference.md` for full field documentation and examples.\n";
+  if (existsSync(path)) {
+    const existingContent = readFileSync(path, "utf-8");
+    const closingIdx = existingContent.indexOf("\n---", existingContent.indexOf("---"));
+    if (closingIdx !== -1) {
+      const afterFrontmatter = existingContent.slice(closingIdx + 4);
+      if (afterFrontmatter.trim()) {
+        body = afterFrontmatter;
+      }
+    }
+  }
+
+  const content = `---\n${frontmatter}---${body}`;
+  await saveFile(path, content);
+  await ctx.waitForIdle();
+  await ctx.reload();
+  ctx.ui.notify(`Saved ${scope} preferences to ${path}`, "info");
 }
 
 async function handleDoctor(args: string, ctx: ExtensionCommandContext, pi: ExtensionAPI): Promise<void> {
@@ -634,10 +693,55 @@ async function handleInspect(ctx: ExtensionCommandContext): Promise<void> {
   }
 }
 
+// ─── Skill Health ─────────────────────────────────────────────────────────────
+
+async function handleSkillHealth(args: string, ctx: ExtensionCommandContext): Promise<void> {
+  const {
+    generateSkillHealthReport,
+    formatSkillHealthReport,
+    formatSkillDetail,
+  } = await import("./skill-health.js");
+
+  const basePath = projectRoot();
+
+  // /gsd skill-health <skill-name> — detail view
+  if (args && !args.startsWith("--")) {
+    const detail = formatSkillDetail(basePath, args);
+    ctx.ui.notify(detail, "info");
+    return;
+  }
+
+  // Parse flags
+  const staleMatch = args.match(/--stale\s+(\d+)/);
+  const staleDays = staleMatch ? parseInt(staleMatch[1], 10) : undefined;
+  const decliningOnly = args.includes("--declining");
+
+  const report = generateSkillHealthReport(basePath, staleDays);
+
+  if (decliningOnly) {
+    if (report.decliningSkills.length === 0) {
+      ctx.ui.notify("No skills flagged for declining performance.", "info");
+      return;
+    }
+    const filtered = {
+      ...report,
+      skills: report.skills.filter(s => s.flagged),
+    };
+    ctx.ui.notify(formatSkillHealthReport(filtered), "info");
+    return;
+  }
+
+  ctx.ui.notify(formatSkillHealthReport(report), "info");
+}
+
 // ─── Preferences Wizard ───────────────────────────────────────────────────────
 
 /** Build short summary strings for each preference category. */
 function buildCategorySummaries(prefs: Record<string, unknown>): Record<string, string> {
+  // Mode
+  const mode = prefs.mode as string | undefined;
+  const modeSummary = mode ?? "(not set)";
+
   // Models
   const models = prefs.models as Record<string, string> | undefined;
   let modelsSummary = "(not configured)";
@@ -704,6 +808,7 @@ function buildCategorySummaries(prefs: Record<string, unknown>): Record<string, 
   }
 
   return {
+    mode: modeSummary,
     models: modelsSummary,
     timeouts: timeoutsSummary,
     git: gitSummary,
@@ -1004,6 +1109,37 @@ async function configureNotifications(ctx: ExtensionCommandContext, prefs: Recor
   }
 }
 
+async function configureMode(ctx: ExtensionCommandContext, prefs: Record<string, unknown>): Promise<void> {
+  const currentMode = prefs.mode as string | undefined;
+  const modeChoice = await ctx.ui.select(
+    `Workflow mode${currentMode ? ` (current: ${currentMode})` : ""}:`,
+    [
+      "solo — auto-push, squash, simple IDs (personal projects)",
+      "team — unique IDs, push branches, pre-merge checks (shared repos)",
+      "(none) — configure everything manually",
+      "(keep current)",
+    ],
+  );
+  const modeStr = typeof modeChoice === "string" ? modeChoice : "";
+  if (modeStr && modeStr !== "(keep current)") {
+    if (modeStr.startsWith("solo")) {
+      prefs.mode = "solo";
+      ctx.ui.notify(
+        "Mode: solo — defaults: auto_push=true, push_branches=false, pre_merge_check=false, merge_strategy=squash, isolation=worktree, commit_docs=true, unique_milestone_ids=false",
+        "info",
+      );
+    } else if (modeStr.startsWith("team")) {
+      prefs.mode = "team";
+      ctx.ui.notify(
+        "Mode: team — defaults: auto_push=false, push_branches=true, pre_merge_check=true, merge_strategy=squash, isolation=worktree, commit_docs=true, unique_milestone_ids=true",
+        "info",
+      );
+    } else {
+      delete prefs.mode;
+    }
+  }
+}
+
 async function configureAdvanced(ctx: ExtensionCommandContext, prefs: Record<string, unknown>): Promise<void> {
   const currentUnique = prefs.unique_milestone_ids;
   const uniqueChoice = await ctx.ui.select(
@@ -1030,6 +1166,7 @@ async function handlePrefsWizard(
   while (true) {
     const summaries = buildCategorySummaries(prefs);
     const options = [
+      `Workflow Mode   ${summaries.mode}`,
       `Models          ${summaries.models}`,
       `Timeouts        ${summaries.timeouts}`,
       `Git             ${summaries.git}`,
@@ -1044,7 +1181,8 @@ async function handlePrefsWizard(
     const choice = typeof raw === "string" ? raw : "";
     if (!choice || choice.includes("Save & Exit")) break;
 
-    if (choice.startsWith("Models"))             await configureModels(ctx, prefs);
+    if (choice.startsWith("Workflow Mode"))      await configureMode(ctx, prefs);
+    else if (choice.startsWith("Models"))        await configureModels(ctx, prefs);
     else if (choice.startsWith("Timeouts"))      await configureTimeouts(ctx, prefs);
     else if (choice.startsWith("Git"))           await configureGit(ctx, prefs);
     else if (choice.startsWith("Skills"))        await configureSkills(ctx, prefs);
@@ -1141,7 +1279,7 @@ function serializePreferencesToFrontmatter(prefs: Record<string, unknown>): stri
 
   // Ordered keys for consistent output
   const orderedKeys = [
-    "version", "always_use_skills", "prefer_skills", "avoid_skills",
+    "version", "mode", "always_use_skills", "prefer_skills", "avoid_skills",
     "skill_rules", "custom_instructions", "models", "skill_discovery",
     "auto_supervisor", "uat_dispatch", "unique_milestone_ids",
     "budget_ceiling", "budget_enforcement", "context_pause_threshold",

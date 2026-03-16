@@ -64,8 +64,17 @@ import {
   formatValidationIssues,
 } from "./observability-validator.js";
 import { ensureGitignore, untrackRuntimeFiles } from "./gitignore.js";
-import { runGSDDoctor, rebuildState } from "./doctor.js";
+import { runGSDDoctor, rebuildState, summarizeDoctorIssues } from "./doctor.js";
+import {
+  preDispatchHealthGate,
+  recordHealthSnapshot,
+  checkHealEscalation,
+  resetProactiveHealing,
+  formatHealthSummary,
+  getConsecutiveErrorUnits,
+} from "./doctor-proactive.js";
 import { snapshotSkills, clearSkillSnapshot } from "./skill-discovery.js";
+import { captureAvailableSkills, getAndClearSkills, resetSkillTelemetry } from "./skill-telemetry.js";
 import {
   initMetrics, resetMetrics, snapshotUnitMetrics, getLedger,
   getProjectTotals, formatCost, formatTokenCount,
@@ -242,6 +251,15 @@ let currentUnit: { type: string; id: string; startedAt: number } | null = null;
 
 /** Track dynamic routing decision for the current unit (for metrics) */
 let currentUnitRouting: { tier: string; modelDowngraded: boolean } | null = null;
+
+/**
+ * Model captured at auto-mode start. Used to prevent model bleed between
+ * concurrent GSD instances sharing the same global settings.json (#650).
+ * When preferences don't specify a model for a unit type, this ensures
+ * the session's original model is re-applied instead of reading from
+ * the shared global settings (which another instance may have overwritten).
+ */
+let autoModeStartModel: { provider: string; id: string } | null = null;
 
 /** Track current milestone to detect transitions */
 let currentMilestoneId: string | null = null;
@@ -481,6 +499,7 @@ export async function stopAuto(ctx?: ExtensionContext, pi?: ExtensionAPI): Promi
   clearUnitTimeout();
   if (lockBase()) clearLock(lockBase());
   clearSkillSnapshot();
+  resetSkillTelemetry();
   _dispatching = false;
   _skipDepth = 0;
 
@@ -561,11 +580,13 @@ export async function stopAuto(ctx?: ExtensionContext, pi?: ExtensionAPI): Promi
   lastBudgetAlertLevel = 0;
   unitLifetimeDispatches.clear();
   currentUnit = null;
+  autoModeStartModel = null;
   currentMilestoneId = null;
   originalBasePath = "";
   completedUnits = [];
   clearSliceProgressCache();
   clearActivityLogState();
+  resetProactiveHealing();
   pendingCrashRecovery = null;
   _handlingAgentEnd = false;
   ctx?.ui.setStatus("gsd-auto", undefined);
@@ -883,6 +904,7 @@ export async function startAuto(
   loadPersistedKeys(base, completedKeySet);
   resetHookState();
   restoreHookState(base);
+  resetProactiveHealing();
   autoStartTime = Date.now();
   resourceSyncedAtOnStart = readResourceSyncedAt();
   completedUnits = [];
@@ -979,6 +1001,14 @@ export async function startAuto(
 
   // Initialize routing history for adaptive learning
   initRoutingHistory(base);
+
+  // Capture the session's current model at auto-mode start (#650).
+  // This prevents model bleed when multiple GSD instances share the
+  // same global settings.json — each instance remembers its own model.
+  const currentModel = ctx.model;
+  if (currentModel) {
+    autoModeStartModel = { provider: currentModel.provider, id: currentModel.id };
+  }
 
   // Snapshot installed skills so we can detect new ones after research
   if (resolveSkillDiscoveryMode() !== "off") {
@@ -1113,6 +1143,35 @@ export async function handleAgentEnd(
       const report = await runGSDDoctor(basePath, { fix: true, scope: doctorScope, fixLevel: "task" });
       if (report.fixesApplied.length > 0) {
         ctx.ui.notify(`Post-hook: applied ${report.fixesApplied.length} fix(es).`, "info");
+      }
+
+      // ── Proactive health tracking ──────────────────────────────────────
+      // Record health snapshot for trend analysis and escalation logic.
+      const summary = summarizeDoctorIssues(report.issues);
+      recordHealthSnapshot(summary.errors, summary.warnings, report.fixesApplied.length);
+
+      // Check if we should escalate to LLM-assisted heal
+      if (summary.errors > 0) {
+        const unresolvedErrors = report.issues
+          .filter(i => i.severity === "error" && !i.fixable)
+          .map(i => ({ code: i.code, message: i.message, unitId: i.unitId }));
+        const escalation = checkHealEscalation(summary.errors, unresolvedErrors);
+        if (escalation.shouldEscalate) {
+          ctx.ui.notify(
+            `Doctor heal escalation: ${escalation.reason}. Dispatching LLM-assisted heal.`,
+            "warning",
+          );
+          try {
+            const { formatDoctorIssuesForPrompt, formatDoctorReport } = await import("./doctor.js");
+            const { dispatchDoctorHeal } = await import("./commands.js");
+            const actionable = report.issues.filter(i => i.severity === "error");
+            const reportText = formatDoctorReport(report, { scope: doctorScope, includeWarnings: true });
+            const structuredIssues = formatDoctorIssuesForPrompt(actionable);
+            dispatchDoctorHeal(pi, doctorScope, reportText, structuredIssues);
+          } catch {
+            // Non-fatal — escalation dispatch failure
+          }
+        }
       }
     } catch {
       // Non-fatal — doctor failure should never block dispatch
@@ -1582,6 +1641,23 @@ async function dispatchNextUnit(
   invalidateAllCaches();
   lastPromptCharCount = undefined;
   lastBaselineCharCount = undefined;
+
+  // ── Pre-dispatch health gate ──────────────────────────────────────────
+  // Lightweight check for critical issues that would cause the next unit
+  // to fail or corrupt state. Auto-heals what it can, blocks on the rest.
+  try {
+    const healthGate = preDispatchHealthGate(basePath);
+    if (healthGate.fixesApplied.length > 0) {
+      ctx.ui.notify(`Pre-dispatch: ${healthGate.fixesApplied.join(", ")}`, "info");
+    }
+    if (!healthGate.proceed) {
+      ctx.ui.notify(healthGate.reason ?? "Pre-dispatch health check failed.", "error");
+      await pauseAuto(ctx, pi);
+      return;
+    }
+  } catch {
+    // Non-fatal — health gate failure should never block dispatch
+  }
 
   const stopDeriveTimer = debugTime("derive-state");
   let state = await deriveState(basePath);
@@ -2252,6 +2328,7 @@ async function dispatchNextUnit(
     }
   }
   currentUnit = { type: unitType, id: unitId, startedAt: Date.now() };
+  captureAvailableSkills(); // Capture skill telemetry at dispatch time (#599)
   writeUnitRuntimeRecord(basePath, unitType, unitId, currentUnit.startedAt, {
     phase: "dispatched",
     wrapupWarningSent: false,
@@ -2471,6 +2548,22 @@ async function dispatchNextUnit(
     }
 
     // modelSet=false is already handled by the "all fallbacks exhausted" warning above
+  } else if (autoModeStartModel) {
+    // No model preference for this unit type — re-apply the model captured
+    // at auto-mode start to prevent bleed from the shared global settings.json
+    // when multiple GSD instances run concurrently (#650).
+    const availableModels = ctx.modelRegistry.getAvailable();
+    const startModel = availableModels.find(
+      m => m.provider === autoModeStartModel!.provider && m.id === autoModeStartModel!.id,
+    );
+    if (startModel) {
+      const ok = await pi.setModel(startModel, { persist: false });
+      if (!ok) {
+        // Fallback: try matching just by ID across providers
+        const byId = availableModels.find(m => m.id === autoModeStartModel!.id);
+        if (byId) await pi.setModel(byId, { persist: false });
+      }
+    }
   }
 
   // Start progress-aware supervision: a soft warning, an idle watchdog, and

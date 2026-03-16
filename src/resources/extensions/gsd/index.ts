@@ -55,9 +55,38 @@ import {
 import { Key } from "@gsd/pi-tui";
 import { join } from "node:path";
 import { existsSync, readFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { shortcutDesc } from "../shared/terminal.js";
 import { Text } from "@gsd/pi-tui";
 import { pauseAutoForProviderError } from "./provider-error-pause.js";
+
+// ── Agent Instructions ────────────────────────────────────────────────────
+// Lightweight "always follow" files injected into every GSD agent session.
+// Global: ~/.gsd/agent-instructions.md   Project: .gsd/agent-instructions.md
+// Both are loaded and concatenated (global first, project appends).
+
+function loadAgentInstructions(): string | null {
+  const parts: string[] = [];
+
+  const globalPath = join(homedir(), ".gsd", "agent-instructions.md");
+  if (existsSync(globalPath)) {
+    try {
+      const content = readFileSync(globalPath, "utf-8").trim();
+      if (content) parts.push(content);
+    } catch { /* non-fatal — skip unreadable file */ }
+  }
+
+  const projectPath = join(process.cwd(), ".gsd", "agent-instructions.md");
+  if (existsSync(projectPath)) {
+    try {
+      const content = readFileSync(projectPath, "utf-8").trim();
+      if (content) parts.push(content);
+    } catch { /* non-fatal — skip unreadable file */ }
+  }
+
+  if (parts.length === 0) return null;
+  return parts.join("\n\n");
+}
 
 // ── Depth verification state ──────────────────────────────────────────────
 let depthVerificationDone = false;
@@ -529,6 +558,13 @@ export default function (pi: ExtensionAPI) {
       }
     }
 
+    // Load agent instructions (global + project)
+    let agentInstructionsBlock = "";
+    const agentInstructions = loadAgentInstructions();
+    if (agentInstructions) {
+      agentInstructionsBlock = `\n\n## Agent Instructions\n\nThe following instructions were provided by the user and must be followed in every session:\n\n${agentInstructions}`;
+    }
+
     const injection = await buildGuidedExecuteContextInjection(event.prompt, process.cwd());
 
     // Worktree context — override the static CWD in the system prompt
@@ -572,7 +608,7 @@ export default function (pi: ExtensionAPI) {
       ].join("\n");
     }
 
-    const fullSystem = `${event.systemPrompt}\n\n[SYSTEM CONTEXT — GSD]\n\n${systemContent}${preferenceBlock}${knowledgeBlock}${newSkillsBlock}${worktreeBlock}`;
+    const fullSystem = `${event.systemPrompt}\n\n[SYSTEM CONTEXT — GSD]\n\n${systemContent}${preferenceBlock}${agentInstructionsBlock}${knowledgeBlock}${newSkillsBlock}${worktreeBlock}`;
     stopContextTimer({
       systemPromptSize: fullSystem.length,
       injectionSize: injection?.length ?? 0,

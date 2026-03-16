@@ -18,9 +18,40 @@ const GLOBAL_PREFERENCES_PATH_UPPERCASE = join(homedir(), ".gsd", "PREFERENCES.m
 const PROJECT_PREFERENCES_PATH_UPPERCASE = join(process.cwd(), ".gsd", "PREFERENCES.md");
 const SKILL_ACTIONS = new Set(["use", "prefer", "avoid"]);
 
+// ─── Workflow Modes ──────────────────────────────────────────────────────────
+
+export type WorkflowMode = "solo" | "team";
+
+/** Default preference values for each workflow mode. */
+const MODE_DEFAULTS: Record<WorkflowMode, Partial<GSDPreferences>> = {
+  solo: {
+    git: {
+      auto_push: true,
+      push_branches: false,
+      pre_merge_check: false,
+      merge_strategy: "squash",
+      isolation: "worktree",
+      commit_docs: true,
+    },
+    unique_milestone_ids: false,
+  },
+  team: {
+    git: {
+      auto_push: false,
+      push_branches: true,
+      pre_merge_check: true,
+      merge_strategy: "squash",
+      isolation: "worktree",
+      commit_docs: true,
+    },
+    unique_milestone_ids: true,
+  },
+};
+
 /** All recognized top-level keys in GSDPreferences. Used to detect typos / stale config. */
 const KNOWN_PREFERENCE_KEYS = new Set<string>([
   "version",
+  "mode",
   "always_use_skills",
   "prefer_skills",
   "avoid_skills",
@@ -28,6 +59,7 @@ const KNOWN_PREFERENCE_KEYS = new Set<string>([
   "custom_instructions",
   "models",
   "skill_discovery",
+  "skill_staleness_days",
   "auto_supervisor",
   "uat_dispatch",
   "unique_milestone_ids",
@@ -107,7 +139,7 @@ export interface AutoSupervisorConfig {
 }
 
 export interface RemoteQuestionsConfig {
-  channel: "slack" | "discord";
+  channel: "slack" | "discord" | "telegram";
   channel_id: string | number;
   timeout_minutes?: number;        // clamped to 1-30
   poll_interval_seconds?: number;  // clamped to 2-30
@@ -115,6 +147,7 @@ export interface RemoteQuestionsConfig {
 
 export interface GSDPreferences {
   version?: number;
+  mode?: WorkflowMode;
   always_use_skills?: string[];
   prefer_skills?: string[];
   avoid_skills?: string[];
@@ -122,6 +155,7 @@ export interface GSDPreferences {
   custom_instructions?: string[];
   models?: GSDModelConfig | GSDModelConfigV2;
   skill_discovery?: SkillDiscoveryMode;
+  skill_staleness_days?: number;  // Skills unused for N days get deprioritized (#599). 0 = disabled. Default: 60.
   auto_supervisor?: AutoSupervisorConfig;
   uat_dispatch?: boolean;
   unique_milestone_ids?: boolean;
@@ -170,25 +204,49 @@ export function loadProjectGSDPreferences(): LoadedGSDPreferences | null {
     ?? loadPreferencesFile(PROJECT_PREFERENCES_PATH_UPPERCASE, "project");
 }
 
+/**
+ * Apply mode defaults as the lowest-priority layer.
+ * Mode defaults fill in undefined fields; any explicit user value wins.
+ */
+export function applyModeDefaults(mode: WorkflowMode, prefs: GSDPreferences): GSDPreferences {
+  const defaults = MODE_DEFAULTS[mode];
+  if (!defaults) return prefs;
+  return mergePreferences(defaults, prefs);
+}
+
 export function loadEffectiveGSDPreferences(): LoadedGSDPreferences | null {
   const globalPreferences = loadGlobalGSDPreferences();
   const projectPreferences = loadProjectGSDPreferences();
 
   if (!globalPreferences && !projectPreferences) return null;
-  if (!globalPreferences) return projectPreferences;
-  if (!projectPreferences) return globalPreferences;
 
-  const mergedWarnings = [
-    ...(globalPreferences.warnings ?? []),
-    ...(projectPreferences.warnings ?? []),
-  ];
+  let result: LoadedGSDPreferences;
+  if (!globalPreferences) {
+    result = projectPreferences!;
+  } else if (!projectPreferences) {
+    result = globalPreferences;
+  } else {
+    const mergedWarnings = [
+      ...(globalPreferences.warnings ?? []),
+      ...(projectPreferences.warnings ?? []),
+    ];
+    result = {
+      path: projectPreferences.path,
+      scope: "project",
+      preferences: mergePreferences(globalPreferences.preferences, projectPreferences.preferences),
+      ...(mergedWarnings.length > 0 ? { warnings: mergedWarnings } : {}),
+    };
+  }
 
-  return {
-    path: projectPreferences.path,
-    scope: "project",
-    preferences: mergePreferences(globalPreferences.preferences, projectPreferences.preferences),
-    ...(mergedWarnings.length > 0 ? { warnings: mergedWarnings } : {}),
-  };
+  // Apply mode defaults as the lowest-priority layer
+  if (result.preferences.mode) {
+    result = {
+      ...result,
+      preferences: applyModeDefaults(result.preferences.mode, result.preferences),
+    };
+  }
+
+  return result;
 }
 
 // ─── Skill Reference Resolution ───────────────────────────────────────────────
@@ -459,6 +517,15 @@ export function resolveSkillDiscoveryMode(): SkillDiscoveryMode {
 }
 
 /**
+ * Resolve the skill staleness threshold in days.
+ * Returns 0 if disabled, default 60 if not configured.
+ */
+export function resolveSkillStalenessDays(): number {
+  const prefs = loadEffectiveGSDPreferences();
+  return prefs?.preferences.skill_staleness_days ?? 60;
+}
+
+/**
  * Resolve which model ID to use for a given auto-mode unit type.
  * Returns undefined if no model preference is set for this unit type.
  */
@@ -656,6 +723,7 @@ export function resolveInlineLevel(): InlineLevel {
 function mergePreferences(base: GSDPreferences, override: GSDPreferences): GSDPreferences {
   return {
     version: override.version ?? base.version,
+    mode: override.mode ?? base.mode,
     always_use_skills: mergeStringLists(base.always_use_skills, override.always_use_skills),
     prefer_skills: mergeStringLists(base.prefer_skills, override.prefer_skills),
     avoid_skills: mergeStringLists(base.avoid_skills, override.avoid_skills),
@@ -663,6 +731,7 @@ function mergePreferences(base: GSDPreferences, override: GSDPreferences): GSDPr
     custom_instructions: mergeStringLists(base.custom_instructions, override.custom_instructions),
     models: { ...(base.models ?? {}), ...(override.models ?? {}) },
     skill_discovery: override.skill_discovery ?? base.skill_discovery,
+    skill_staleness_days: override.skill_staleness_days ?? base.skill_staleness_days,
     auto_supervisor: { ...(base.auto_supervisor ?? {}), ...(override.auto_supervisor ?? {}) },
     uat_dispatch: override.uat_dispatch ?? base.uat_dispatch,
     unique_milestone_ids: override.unique_milestone_ids ?? base.unique_milestone_ids,
@@ -714,12 +783,31 @@ export function validatePreferences(preferences: GSDPreferences): {
     }
   }
 
+  // ─── Workflow Mode ──────────────────────────────────────────────────
+  if (preferences.mode !== undefined) {
+    const validModes = new Set<string>(["solo", "team"]);
+    if (typeof preferences.mode === "string" && validModes.has(preferences.mode)) {
+      validated.mode = preferences.mode as WorkflowMode;
+    } else {
+      errors.push(`invalid mode "${preferences.mode}" — must be one of: solo, team`);
+    }
+  }
+
   const validDiscoveryModes = new Set(["auto", "suggest", "off"]);
   if (preferences.skill_discovery) {
     if (validDiscoveryModes.has(preferences.skill_discovery)) {
       validated.skill_discovery = preferences.skill_discovery;
     } else {
       errors.push(`invalid skill_discovery value: ${preferences.skill_discovery}`);
+    }
+  }
+
+  if (preferences.skill_staleness_days !== undefined) {
+    const days = Number(preferences.skill_staleness_days);
+    if (Number.isFinite(days) && days >= 0) {
+      validated.skill_staleness_days = Math.floor(days);
+    } else {
+      errors.push(`invalid skill_staleness_days: must be a non-negative number`);
     }
   }
 
