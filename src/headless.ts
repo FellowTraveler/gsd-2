@@ -15,10 +15,7 @@ import { existsSync, readFileSync, mkdirSync, writeFileSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { ChildProcess } from 'node:child_process'
 
-// RpcClient is not in @gsd/pi-coding-agent's public exports — import from dist directly.
-// This relative path resolves correctly from both src/ (via tsx) and dist/ (compiled).
-import { RpcClient } from '../packages/pi-coding-agent/dist/modes/rpc/rpc-client.js'
-import { attachJsonlLineReader, serializeJsonLine } from '../packages/pi-coding-agent/dist/modes/rpc/jsonl.js'
+import { RpcClient, attachJsonlLineReader, serializeJsonLine } from '@gsd/pi-coding-agent'
 
 // ---------------------------------------------------------------------------
 // Types
