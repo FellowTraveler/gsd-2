@@ -6,8 +6,9 @@
  * utility.
  */
 
-import { loadFile, parseContinue, parseSummary, extractUatType, loadActiveOverrides, formatOverridesSection, parseTaskPlanFile } from "./files.js";
+import { loadFile, parseContinue, parseSummary, loadActiveOverrides, formatOverridesSection, parseTaskPlanFile } from "./files.js";
 import type { Override, UatType } from "./files.js";
+import { hasVerdict, getUatType } from "./verdict-parser.js";
 import { loadPrompt, inlineTemplate } from "./prompt-loader.js";
 import {
   resolveMilestoneFile, resolveSliceFile, resolveSlicePath,
@@ -782,8 +783,8 @@ export async function checkNeedsRunUat(
         const uatContent = await loadFile(uatFile);
         if (!uatContent) return null;
         // If the UAT file already contains a verdict, UAT has been run — skip
-        if (/verdict:\s*[\w-]+/i.test(uatContent)) return null;
-        const uatType = extractUatType(uatContent) ?? "artifact-driven";
+        if (hasVerdict(uatContent)) return null;
+        const uatType = getUatType(uatContent);
         return { sliceId: sid, uatType };
       }
     }
@@ -806,8 +807,8 @@ export async function checkNeedsRunUat(
   const uatContentFb = await loadFile(uatFileFb);
   if (!uatContentFb) return null;
   // If the UAT file already contains a verdict, UAT has been run — skip
-  if (/verdict:\s*[\w-]+/i.test(uatContentFb)) return null;
-  const uatTypeFb = extractUatType(uatContentFb) ?? "artifact-driven";
+  if (hasVerdict(uatContentFb)) return null;
+  const uatTypeFb = getUatType(uatContentFb);
   return { sliceId: uatSid, uatType: uatTypeFb };
 }
 
@@ -1505,7 +1506,7 @@ export async function buildRunUatPrompt(
   const inlinedContext = capPreamble(`## Inlined Context (preloaded — do not re-read these files)\n\n${inlined.join("\n\n---\n\n")}`);
 
   const uatResultPath = join(base, relSliceFile(base, mid, sliceId, "UAT"));
-  const uatType = extractUatType(uatContent) ?? "artifact-driven";
+  const uatType = getUatType(uatContent);
 
   return loadPrompt("run-uat", {
     workingDirectory: base,

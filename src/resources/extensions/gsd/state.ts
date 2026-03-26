@@ -40,6 +40,7 @@ import { nativeBatchParseGsdFiles, type BatchParsedFile } from './native-parser-
 import { join, resolve } from 'path';
 import { existsSync, readdirSync } from 'node:fs';
 import { debugCount, debugTime } from './debug-logger.js';
+import { extractVerdict } from './verdict-parser.js';
 
 import {
   isDbAvailable,
@@ -92,11 +93,8 @@ export function isMilestoneComplete(roadmap: Roadmap): boolean {
  * after remediation slices are executed.
  */
 export function isValidationTerminal(validationContent: string): boolean {
-  const match = validationContent.match(/^---\n([\s\S]*?)\n---/);
-  if (!match) return false;
-  const verdict = match[1].match(/verdict:\s*(\S+)/);
-  if (!verdict) return false;
-  const v = verdict[1] === 'passed' ? 'pass' : verdict[1];
+  const v = extractVerdict(validationContent);
+  if (!v) return false;
   // 'pass' and 'needs-attention' are always terminal.
   // 'needs-remediation' is treated as terminal to prevent infinite loops
   // when no remediation slices exist in the roadmap (#832). The validation
